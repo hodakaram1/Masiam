@@ -129,6 +129,37 @@ typedef struct _DBK_VA_TO_PA {
 } DBK_VA_TO_PA, *PDBK_VA_TO_PA;
 #pragma pack(pop)
 
+// IOCTL_CE_QUERY_VIRTUAL_MEMORY (0x0803):
+//   input  { UINT64 ProcessId; UINT64 StartAddress; }
+//   output { UINT64 Length; ULONG Protection; }   (same buffer, returned in place)
+// Length is the byte count from StartAddress (page-aligned down) until the
+// page-table state changes; Protection is PAGE_EXECUTE_READWRITE / PAGE_EXECUTE_READ
+// / PAGE_NOACCESS. Enumerated fully from the kernel, so it works on protected
+// processes and 32-bit targets that user-mode VirtualQueryEx cannot open.
+#pragma pack(push, 1)
+typedef struct _DBK_QUERY_VMEM {
+    ULONG64 ProcessId;
+    ULONG64 StartAddress;
+} DBK_QUERY_VMEM, *PDBK_QUERY_VMEM;
+
+typedef struct _DBK_QUERY_VMEM_OUT {
+    ULONG64 Length;
+    ULONG   Protection;
+} DBK_QUERY_VMEM_OUT, *PDBK_QUERY_VMEM_OUT;
+
+// Input/output share one buffered buffer (in-place): the driver overwrites
+// the 16-byte input header with the 12-byte output.
+typedef struct _DBK_QUERY_VMEM_INOUT {
+    union {
+        DBK_QUERY_VMEM     In;
+        DBK_QUERY_VMEM_OUT Out;
+    };
+} DBK_QUERY_VMEM_INOUT, *PDBK_QUERY_VMEM_INOUT;
+#pragma pack(pop)
+
+// Max bytes the driver can read/write in one IOCTL (WORD size field).
+#define DBK_MAX_IO_SIZE 0xFFFF
+
 // IDT / GDT are returned by the driver as: WORD limit (offset 0) + pointer (offset 2)
 #pragma pack(push, 2)
 typedef struct _DBK_SEG_TABLE {
@@ -218,6 +249,7 @@ bool DbkSuspendProcess(ULONG pid);
 bool DbkResumeProcess(ULONG pid);
 bool DbkOpenProcessHandle(ULONG pid, ULONG64* handle, UCHAR* special);
 bool DbkGetPEPROCESS(ULONG pid, ULONG64* out);
+bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* protection);
 
 // =====================================================================
 //  Workers / UI

@@ -236,7 +236,7 @@ bool DbkIoctl(ULONG code, const void* in, ULONG inSize, void* out, ULONG outSize
 
 bool DbkReadBytes(ULONG pid, ULONG_PTR addr, void* out, ULONG size)
 {
-    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0 || size == 0 || size > 0xFFFF || out == NULL)
+    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0 || size == 0 || size > DBK_MAX_IO_SIZE || out == NULL)
         return false;
 
     DBK_READ_REQUEST req;
@@ -250,7 +250,7 @@ bool DbkReadBytes(ULONG pid, ULONG_PTR addr, void* out, ULONG size)
 
 bool DbkWriteBytes(ULONG pid, ULONG_PTR addr, const void* in, ULONG size)
 {
-    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0 || size == 0 || size > 0xFFFF || in == NULL)
+    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0 || size == 0 || size > DBK_MAX_IO_SIZE || in == NULL)
         return false;
 
     ULONG total = DBK_WRITE_HEADER_SIZE + size;
@@ -676,6 +676,27 @@ bool DbkGetPEPROCESS(ULONG pid, ULONG64* out)
     return false;
 }
 
+bool DbkQueryVirtualMemory(ULONG pid, ULONG_PTR addr, ULONG_PTR* length, ULONG* protection)
+{
+    if (length) *length = 0;
+    if (protection) *protection = 0;
+    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0)
+        return false;
+
+    // Input and output share the same buffered buffer: the driver reads the
+    // {pid, addr} header, then overwrites it with {length, protection}.
+    DBK_QUERY_VMEM_INOUT buf = {};
+    buf.In.ProcessId = pid;
+    buf.In.StartAddress = addr;
+
+    if (!DbkIoctl(IOCTL_CE_QUERY_VIRTUAL_MEMORY, &buf, sizeof(buf), &buf, sizeof(buf)))
+        return false;
+
+    if (length) *length = (ULONG_PTR)buf.Out.Length;
+    if (protection) *protection = buf.Out.Protection;
+    return true;
+}
+
 // =====================================================================
 //  Freeze / Cheat Table Loop
 // =====================================================================
@@ -743,8 +764,10 @@ void RefreshModules()
 }
 
 // =====================================================================
-//  Memory region enumeration & scanning (regions via VirtualQueryEx,
-//  reads performed through the DBK64 driver)
+//  Memory region enumeration & scanning
+//  Regions are enumerated through the DBK64 driver (IOCTL_CE_QUERY_VIRTUAL_MEMORY)
+//  so protected processes (svchost/PPL) and guarded games (anti-cheat) are
+//  scanned too; the same driver performs the actual reads.
 // =====================================================================
 struct RegionInfo {
     ULONG_PTR Start;
@@ -754,15 +777,53 @@ struct RegionInfo {
 static ULONG_PTR MaxAddr(ULONG_PTR a, ULONG_PTR b) { return a > b ? a : b; }
 static ULONG_PTR MinAddr(ULONG_PTR a, ULONG_PTR b) { return a < b ? a : b; }
 
+// Kernel-reported protection values (see FindFirstDifferentAddress in memscan.c)
 static bool IsReadableProtect(DWORD protect)
 {
-    if (protect == 0 || protect == PAGE_NOACCESS) return false;
-    if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-    return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+    // PAGE_EXECUTE_READ (0x20) and PAGE_EXECUTE_READWRITE (0x40) are readable;
+    // PAGE_NOACCESS (0x01) / unknown are not.
+    return (protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE);
 }
 
+// Enumerate readable regions by walking the target's page tables in the kernel.
 static std::vector<RegionInfo> EnumerateRegions(ULONG pid, ULONG_PTR rangeStart, ULONG_PTR rangeEnd)
+{
+    std::vector<RegionInfo> regions;
+
+    ULONG_PTR cursor = rangeStart & ~(ULONG_PTR)0xFFF; // page-aligned start
+    ULONG guard = 0;
+
+    while (cursor < rangeEnd) {
+        if (++guard > 1 << 22) break; // safety: ~4M queries max
+
+        ULONG_PTR length = 0;
+        ULONG protection = 0;
+        if (!DbkQueryVirtualMemory(pid, cursor, &length, &protection))
+            break; // no more regions (or driver call failed)
+
+        if (length == 0)
+            break;
+
+        ULONG_PTR base = cursor & ~(ULONG_PTR)0xFFF;
+        ULONG_PTR end = base + length;
+        if (end <= base)
+            break; // overflow / wrapped past end of address space
+
+        if (IsReadableProtect(protection)) {
+            ULONG_PTR s = MaxAddr(base, rangeStart);
+            ULONG_PTR e = MinAddr(end, rangeEnd);
+            if (s < e) regions.push_back({ s, e });
+        }
+
+        cursor = end;
+    }
+
+    return regions;
+}
+
+// User-mode fallback when the kernel walker returns nothing (e.g. querying the
+// kernel page tables is unavailable on this OS build).
+static std::vector<RegionInfo> EnumerateRegionsUserMode(ULONG pid, ULONG_PTR rangeStart, ULONG_PTR rangeEnd)
 {
     std::vector<RegionInfo> regions;
     HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
@@ -775,7 +836,10 @@ static std::vector<RegionInfo> EnumerateRegions(ULONG pid, ULONG_PTR rangeStart,
         if (!queried) break;
 
         ULONG_PTR regionEnd = (ULONG_PTR)mbi.BaseAddress + (ULONG_PTR)mbi.RegionSize;
-        bool readable = (mbi.State == MEM_COMMIT) && IsReadableProtect(mbi.Protect);
+        bool readable = (mbi.State == MEM_COMMIT) &&
+            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 
         if (readable) {
             ULONG_PTR s = MaxAddr((ULONG_PTR)mbi.BaseAddress, rangeStart);
@@ -811,9 +875,11 @@ void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bo
     ULONG_PTR rEnd = useRange ? rangeEnd : 0x7FFFFFFFFFFFULL;
 
     std::vector<RegionInfo> regions = EnumerateRegions(targetPid, rStart, rEnd);
+    if (regions.empty())
+        regions = EnumerateRegionsUserMode(targetPid, rStart, rEnd);
 
     std::vector<ULONG_PTR> results;
-    std::vector<BYTE> chunk(65536);
+    std::vector<BYTE> chunk(DBK_MAX_IO_SIZE);   // max the driver can read per IOCTL
     ULONG64 totalBytes = 0, doneBytes = 0;
     for (auto& r : regions) totalBytes += (ULONG64)(r.End - r.Start);
 

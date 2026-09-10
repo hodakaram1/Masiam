@@ -27,9 +27,11 @@
 
 #pragma once
 
-#if defined(_GLFW_USE_CONFIG_H)
- #include "glfw_config.h"
-#endif
+// Vendored build: include our pre-made configuration unconditionally.
+// (Upstream GLFW gates this behind _GLFW_USE_CONFIG_H, which only its CMake
+// build defines. We compile GLFW's sources directly, so always pull in
+// glfw_config.h — it defines _GLFW_WIN32 for this Win32-only build.)
+#include "glfw_config.h"
 
 #if defined(GLFW_INCLUDE_GLCOREARB) || \
     defined(GLFW_INCLUDE_ES1)       || \

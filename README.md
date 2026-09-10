@@ -8,6 +8,11 @@ pointer resolver, and a DBK64 kernel feature tab) backed by the `DBKKernel`
   the `IOCTL_CE_*` device-control interface (byte-identical to
   `DBKKernel/IOPLDispatcher.h`).
 - `DBKKernel/` — the kernel driver, built as `DBK64.sys` (x64) / `DBK32.sys` (x86).
+- `third_party/` — vendored, pinned third-party sources compiled directly into
+  the GUI (no vcpkg or external package manager required):
+  - **Dear ImGui** `v1.90.9`
+  - **GLFW** `3.3.9`
+  - **Zydis** `v4.1.0` + **Zycore** `v1.5.0`
 - `King.sln` — solution that builds `DBKKernel` then `Imno` (Imno depends on
   DBKKernel). `build.bat` builds the Debug x64 configuration and logs errors to
   `build_error.log`.
@@ -28,25 +33,15 @@ Both projects output to `<repo>\x64\Debug\`, so `DBK64.sys` lands next to
 
 ## Requirements to build
 
+Everything the GUI needs is already in the repo (`third_party/`). You only need:
+
 - **Visual Studio 2019** (v142 toolset) with the **"Desktop development with C++"**
-  workload.
+  workload (includes the Windows 10 SDK).
 - **Windows Driver Kit (WDK 10)** for the `WindowsKernelModeDriver10.0` platform
-  toolset (needed to build `DBKKernel`).
-- **Third-party libraries for the GUI** (not vendored in this repo — they must be
-  available via your include/library paths):
+  toolset (needed to build the `DBKKernel` driver).
 
-  | Package  | Used for                          | Headers used                     |
-  |----------|-----------------------------------|----------------------------------|
-  | Dear ImGui | UI                                | `imgui.h`, `imgui_impl_dx11.h`, `imgui_impl_glfw.h` |
-  | GLFW     | Window + input                    | `GLFW/glfw3.h`, `GLFW/glfw3native.h` |
-  | Zydis    | Instruction decoding (patcher)    | `Zydis/Zydis.h`                  |
-  | AsmJit   | (reserved for runtime patching)   | `asmjit/asmjit.h`                |
-
-  Recommended: install them with **vcpkg** and integrate it with MSBuild, or add
-  the include/lib directories in *View → Property Manager →
-  Microsoft.Cpp.x64.user.props*. The libraries are linked via
-  `#pragma comment(lib, ...)` plus your library path setup; Direct3D 11 and the
-  other Windows system libs come from the Windows SDK.
+No vcpkg / Conan / NuGet setup is required — `Imno` compiles Dear ImGui, GLFW,
+Zydis and Zycore straight from the vendored sources.
 
 ## Building
 

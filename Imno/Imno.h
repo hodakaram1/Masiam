@@ -24,9 +24,8 @@
 #include "imgui_impl_dx11.h"
 #include "Resource.h"
 
-// Zydis & AsmJit Includes (vcpkg headers)
+// Zydis (vendored in third_party/) for instruction decoding.
 #include <Zydis/Zydis.h>
-#include <asmjit/asmjit.h>
 
 // =====================================================================
 //  DBK64 Kernel Driver Configuration

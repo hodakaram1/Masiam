@@ -142,7 +142,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\imgui\backends;$(ProjectDir)..\third_party\glfw\include;$(ProjectDir)..\third_party\zydis\include;$(ProjectDir)..\third_party\zydis\src;$(ProjectDir)..\third_party\zycore\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WIN32_WINNT=0x0601;_CRT_SECURE_NO_WARNINGS;ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_WIN32_WINNT=0x0601;_CRT_SECURE_NO_WARNINGS;ZYDIS_STATIC_BUILD;ZYCORE_STATIC_BUILD;_GLFW_WIN32;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -190,7 +190,9 @@
     <ClCompile Include="..\third_party\zydis\src\Register.c" />
     <ClCompile Include="..\third_party\zydis\src\Segment.c" />
     <ClCompile Include="..\third_party\zydis\src\SharedData.c" />
-    <ClCompile Include="..\third_party\zydis\src\String.c" />
+    <ClCompile Include="..\third_party\zydis\src\String.c">
+      <ObjectFileName>$(IntDir)zydis_String.obj</ObjectFileName>
+    </ClCompile>
     <ClCompile Include="..\third_party\zydis\src\Utils.c" />
     <ClCompile Include="..\third_party\zydis\src\Zydis.c" />
     <!-- Zycore -->
@@ -199,7 +201,9 @@
     <ClCompile Include="..\third_party\zycore\src\Bitset.c" />
     <ClCompile Include="..\third_party\zycore\src\Format.c" />
     <ClCompile Include="..\third_party\zycore\src\List.c" />
-    <ClCompile Include="..\third_party\zycore\src\String.c" />
+    <ClCompile Include="..\third_party\zycore\src\String.c">
+      <ObjectFileName>$(IntDir)zycore_String.obj</ObjectFileName>
+    </ClCompile>
     <ClCompile Include="..\third_party\zycore\src\Vector.c" />
     <ClCompile Include="..\third_party\zycore\src\Zycore.c" />
     <ClCompile Include="..\third_party\zycore\src\API\Memory.c" />

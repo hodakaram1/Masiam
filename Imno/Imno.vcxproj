@@ -172,6 +172,8 @@
     <ClCompile Include="..\third_party\glfw\src\win32_time.c" />
     <ClCompile Include="..\third_party\glfw\src\win32_window.c" />
     <ClCompile Include="..\third_party\glfw\src\wgl_context.c" />
+    <ClCompile Include="..\third_party\glfw\src\egl_context.c" />
+    <ClCompile Include="..\third_party\glfw\src\osmesa_context.c" />
     <!-- Zydis -->
     <ClCompile Include="..\third_party\zydis\src\Decoder.c" />
     <ClCompile Include="..\third_party\zydis\src\DecoderData.c" />

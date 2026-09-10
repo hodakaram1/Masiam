@@ -100,7 +100,7 @@ void forOneCpu(CCHAR cpunr, PKDEFERRED_ROUTINE dpcfunction, PVOID DeferredContex
 		preDPCCallback(cpunr, dpcfunction, DeferredContext, &SystemArgument1, &SystemArgument2);
 	
 
-	dpc = ExAllocatePool(NonPagedPool, sizeof(KDPC));
+	dpc = ExAllocatePoolWithTag(NonPagedPool, sizeof(KDPC), 0);
 	KeInitializeDpc(dpc, dpcfunction, DeferredContext);
 	KeSetTargetProcessorDpc(dpc, cpunr);
 	KeInsertQueueDpc(dpc, SystemArgument1, SystemArgument2);
@@ -134,7 +134,7 @@ calls a specified dpcfunction for each cpu on the system
 		cpus=cpus / 2;		
 	}
 
-	dpc=ExAllocatePool(NonPagedPool, sizeof(KDPC)*cpucount);
+	dpc=ExAllocatePoolWithTag(NonPagedPool, sizeof(KDPC)*cpucount, 0);
 
 		
 
@@ -194,7 +194,7 @@ calls a specified dpcfunction for each cpu on the system
 		cpus = cpus / 2;
 	}
 
-	dpc = ExAllocatePool(NonPagedPool, sizeof(KDPC)*cpucount);
+	dpc = ExAllocatePoolWithTag(NonPagedPool, sizeof(KDPC)*cpucount, 0);
 
 	cpus = KeQueryActiveProcessors();
 	cpunr = 0;

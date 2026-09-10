@@ -47,7 +47,7 @@ Caller is responsible for calling ExFreePool on the buffer
 		{
 			
 			*size=fsi.EndOfFile.LowPart;
-			*buffer=ExAllocatePool(PagedPool, fsi.EndOfFile.LowPart);	 //caller MUST free this
+			*buffer=ExAllocatePoolWithTag(PagedPool, fsi.EndOfFile.LowPart, 0);	 //caller MUST free this
 			
 
 			if (*buffer)
@@ -94,7 +94,7 @@ Calculates a hash from the buffer and then checks the signature
 			if (s==STATUS_SUCCESS)
 			{
 				BCRYPT_HASH_HANDLE hHash;
-				PUCHAR pbHashObject=ExAllocatePool(PagedPool, objectlength);
+				PUCHAR pbHashObject=ExAllocatePoolWithTag(PagedPool, objectlength, 0);
 
 				if (pbHashObject)
 				{
@@ -108,7 +108,7 @@ Calculates a hash from the buffer and then checks the signature
 							s=BCryptGetProperty(hashAlgoritm, BCRYPT_HASH_LENGTH, (PUCHAR)&hashlength, sizeof(DWORD), &size, 0); 
 							if (s==STATUS_SUCCESS)
 							{
-								PUCHAR pbHashBuffer=ExAllocatePool(PagedPool, hashlength);
+								PUCHAR pbHashBuffer=ExAllocatePoolWithTag(PagedPool, hashlength, 0);
 								if (pbHashBuffer)
 								{
 									s=BCryptFinishHash(hHash, pbHashBuffer, hashlength, 0);

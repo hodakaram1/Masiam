@@ -709,7 +709,7 @@ unsigned int vmx_add_memory(UINT64 *list, int count)
 		UINT64 PhysicalPages[0];
 	} AddMemoryInfoCall, *PAddMemoryInfoCall;
 #pragma pack()
-	PAddMemoryInfoCall vmcallinfo=ExAllocatePool(NonPagedPool, sizeof(AddMemoryInfoCall) + count * sizeof(UINT64));
+	PAddMemoryInfoCall vmcallinfo=ExAllocatePoolWithTag(NonPagedPool, sizeof(AddMemoryInfoCall) + count * sizeof(UINT64), 0);
 
 
 	DbgPrint("vmx_add_memory(%p,%d)\n", list, count);

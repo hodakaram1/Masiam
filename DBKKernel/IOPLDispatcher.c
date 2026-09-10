@@ -90,7 +90,7 @@ void mykapc(PKAPC Apc, PKNORMAL_ROUTINE NormalRoutine, PVOID NormalContext, PVOI
 	PKAPC      kApc;
 	LARGE_INTEGER Timeout;
 
-	kApc = ExAllocatePool(NonPagedPool, sizeof(KAPC));
+	kApc = ExAllocatePoolWithTag(NonPagedPool, sizeof(KAPC), 0);
 
 	ExFreePool(Apc);
 
@@ -135,7 +135,7 @@ void CreateRemoteAPC(ULONG threadid,PVOID addresstoexecute)
 	PKTHREAD   kThread;
 	PKAPC      kApc;
 
-	kApc = ExAllocatePool(NonPagedPool, sizeof(KAPC));
+	kApc = ExAllocatePoolWithTag(NonPagedPool, sizeof(KAPC), 0);
 
 	kThread=(PKTHREAD)getPEThread(threadid);
 	DbgPrint("(PVOID)KThread=%p\n",kThread);
@@ -284,7 +284,7 @@ Called if dbvm has loaded the driver. Use this to setup a fake irp
 	IRP FakeIRP;
 	BOOL r;
 	PVOID buffer;
-	buffer=ExAllocatePool(PagedPool, max(nInBufferSize, nOutBufferSize));
+	buffer=ExAllocatePoolWithTag(PagedPool, max(nInBufferSize, nOutBufferSize), 0);
 	RtlCopyMemory(buffer, lpInBuffer, nInBufferSize);	
 
 
@@ -1305,7 +1305,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				inp=Irp->AssociatedIrp.SystemBuffer;
 				size=inp->Size;
 
-				address=ExAllocatePool(NonPagedPool,size);
+				address=ExAllocatePoolWithTag(NonPagedPool,size, 0);
 				*(PUINT64)Irp->AssociatedIrp.SystemBuffer=0;
 				*(PUINT_PTR)Irp->AssociatedIrp.SystemBuffer=(UINT_PTR)address;
 				
@@ -2455,10 +2455,10 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				if (pfnlist)
 				{
 					//convert the pfnlist to a list dbvm understands, and go in blocks of 32
-					mi = ExAllocatePool(PagedPool, sizeof(DBVMOffloadMemInfo));
+					mi = ExAllocatePoolWithTag(PagedPool, sizeof(DBVMOffloadMemInfo), 0);
 					if (mi)
 					{
-						mi->List = ExAllocatePool(PagedPool, sizeof(UINT64) * 32);
+						mi->List = ExAllocatePoolWithTag(PagedPool, sizeof(UINT64) * 32, 0);
 						if (mi->List)
 						{
 							mi->Count = 0;

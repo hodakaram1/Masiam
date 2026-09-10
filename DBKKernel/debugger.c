@@ -205,13 +205,13 @@ void debugger_initialize(void)
 
 
 	StackCount = getCpuCount() * 4;
-	Stacks = (PSavedStack*)ExAllocatePool(NonPagedPool, StackCount*sizeof(PSavedStack));
+	Stacks = (PSavedStack*)ExAllocatePoolWithTag(NonPagedPool, StackCount*sizeof(PSavedStack), 0);
 
 
 	int i;
 	for (i = 0; i < StackCount; i++)
 	{
-		Stacks[i] = (PSavedStack)ExAllocatePool(NonPagedPool, sizeof(SavedStack));
+		Stacks[i] = (PSavedStack)ExAllocatePoolWithTag(NonPagedPool, sizeof(SavedStack), 0);
 		RtlZeroMemory(Stacks[i], sizeof(SavedStack));
 	}
 }
@@ -248,7 +248,7 @@ void debugger_growstack()
 		int newStackCount = StackCount * 2;
 		int i;
 		PSavedStack *newStacks;
-		newStacks = (PSavedStack*)ExAllocatePool(NonPagedPool, newStackCount * sizeof(PSavedStack));
+		newStacks = (PSavedStack*)ExAllocatePoolWithTag(NonPagedPool, newStackCount * sizeof(PSavedStack), 0);
 
 		if (newStacks)
 		{
@@ -257,7 +257,7 @@ void debugger_growstack()
 
 			for (i = StackCount; i < newStackCount; i++)
 			{
-				newStacks[i] = (PSavedStack)ExAllocatePool(NonPagedPool, sizeof(SavedStack));
+				newStacks[i] = (PSavedStack)ExAllocatePoolWithTag(NonPagedPool, sizeof(SavedStack), 0);
 				if (newStacks[i])				
 					RtlZeroMemory(newStacks[i], sizeof(SavedStack));				
 				else

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 echo ==========================================
-echo   Building MasterXDriver & Imno Suite
+echo   Building DBKKernel driver & Imno GUI
 echo ==========================================
 
 REM Find MSBuild path
@@ -30,14 +30,16 @@ echo ==========================================
 echo   BUILD SUCCESSFUL! (Debug x64)
 echo ==========================================
 
-REM Make sure the driver sits next to the app (both projects output to the solution x64\Debug)
-if not exist "Imno\x64\Debug\MasterXDriver.sys" (
-    if exist "MasterXDriver\x64\Debug\MasterXDriver.sys" (
-        copy /Y "MasterXDriver\x64\Debug\MasterXDriver.sys" "Imno\x64\Debug\" >nul
-        echo Copied MasterXDriver.sys next to Imno.exe
+REM Make sure the DBK64 driver sits next to the app (both projects output to solution x64\Debug)
+if not exist "x64\Debug\DBK64.sys" (
+    if exist "DBKKernel\x64\Debug\DBK64.sys" (
+        copy /Y "DBKKernel\x64\Debug\DBK64.sys" "x64\Debug\" >nul
+        echo Copied DBK64.sys next to Imno.exe
     ) else (
-        echo [INFO] Driver already in the app folder or output is in solution x64\Debug
+        echo [INFO] DBK64.sys already in x64\Debug or driver output is elsewhere
     )
+) else (
+    echo DBK64.sys is already next to Imno.exe
 )
 
 echo.

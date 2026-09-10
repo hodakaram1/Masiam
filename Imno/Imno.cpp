@@ -4,6 +4,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // Smart Pointer Resolver struct (must be before globals)
 struct ResolvedPointer {
@@ -19,9 +20,10 @@ struct ResolvedPointer {
 HWND g_hWnd = NULL;
 GLFWwindow* g_Window = NULL;
 HANDLE g_hDriver = INVALID_HANDLE_VALUE;
+bool   g_DriverConnected = false;
 
-std::vector<ProcessInfoV2> g_ProcessList;
-std::vector<ModuleInfoV2>  g_LoadedModules;
+std::vector<ProcessInfo> g_ProcessList;
+std::vector<ModuleInfo>  g_LoadedModules;
 ULONG g_SelectedPid = 0;
 char  g_ProcessFilter[64] = "";
 char  g_ModuleFilter[64] = "";
@@ -29,7 +31,7 @@ char  g_ModuleFilter[64] = "";
 // Scan State
 int   g_SelectedDataType = 4; // 4 = 4 Bytes
 char  g_ScanValueInput[128] = "";
-char  g_ScanRangeStart[64] = "0";
+char  g_ScanRangeStart[64] = "0x10000";
 char  g_ScanRangeEnd[64] = "0x7FFFFFFFFFFF";
 bool  g_UseScanRange = false;
 bool  g_AllowUnaligned = false;
@@ -57,41 +59,111 @@ ResolvedPointer g_LastResolved = {};
 char g_PatchAddressInput[128] = "";
 char g_PatchPatternInput[128] = "0x90, 0x90";
 
+// Kernel tab state
+ULONG     g_KernelVersion = 0;
+ULONG64   g_KernelCR0 = 0;
+ULONG64   g_KernelCR3 = 0;
+ULONG64   g_KernelCR4 = 0;
+ULONG64   g_KernelMsrValue = 0;
+DBK_SEG_TABLE g_KernelIdt = {};
+DBK_SEG_TABLE g_KernelGdt = {};
+char      g_MsrReadInput[64] = "0xC0000082";   // IA32_LSTAR
+char      g_MsrWriteMsr[64] = "0xC0000082";
+char      g_MsrWriteValue[64] = "0";
+char      g_PhysReadAddr[64] = "0";
+char      g_PhysReadSize[64] = "0x100";
+char      g_PhysReadDump[8192] = "";
+char      g_PhysWriteAddr[64] = "0";
+char      g_PhysWriteHex[1024] = "0x90, 0x90";
+char      g_AllocNonPagedSize[64] = "0x1000";
+ULONG64   g_AllocNonPagedAddr = 0;
+char      g_AllocProcessSize[64] = "0x1000";
+ULONG64   g_AllocProcessAddr = 0;
+ULONG64   g_OpenProcessHandle = 0;
+ULONG64   g_PeProcess = 0;
+char      g_KernelStatus[256] = "";
+
 // =====================================================================
-//  Driver Control Helpers
+//  Privilege & Driver Control Helpers
 // =====================================================================
+bool EnableSeDebugPrivilege()
+{
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return false;
+
+    TOKEN_PRIVILEGES tp = {};
+    LUID luid;
+    if (!LookupPrivilegeValueW(NULL, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    bool ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL) != FALSE;
+    CloseHandle(hToken);
+    return ok;
+}
+
 bool LoadAndStartDriver()
 {
+    WCHAR sysPath[MAX_PATH];
+    GetModuleFileNameW(NULL, sysPath, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(sysPath, L'\\');
+    if (lastSlash) *(lastSlash + 1) = L'\0';
+    else return false;
+    wcscat_s(sysPath, MAX_PATH, DBK_DRIVER_FILE);
+
+    if (GetFileAttributesW(sysPath) == INVALID_FILE_ATTRIBUTES)
+        return false;
+
     SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!hSCM) return false;
 
-    WCHAR driverPath[MAX_PATH];
-    GetModuleFileNameW(NULL, driverPath, MAX_PATH);
-    wchar_t* lastSlash = wcsrchr(driverPath, L'\\');
-    if (lastSlash) *(lastSlash + 1) = L'\0';
-    wcscat_s(driverPath, MAX_PATH, L"MasterXDriver.sys");
-
-    SC_HANDLE hService = CreateServiceW(
-        hSCM,
-        L"MasterXDriver",
-        L"MasterXDriver",
-        SERVICE_ALL_ACCESS,
-        SERVICE_KERNEL_DRIVER,
-        SERVICE_DEMAND_START,
-        SERVICE_ERROR_NORMAL,
-        driverPath,
-        NULL, NULL, NULL, NULL, NULL
-    );
+    SC_HANDLE hService = OpenServiceW(hSCM, DBK_SERVICE_NAME, SERVICE_ALL_ACCESS);
+    if (!hService) {
+        hService = CreateServiceW(
+            hSCM,
+            DBK_SERVICE_NAME,
+            DBK_SERVICE_NAME,
+            SERVICE_ALL_ACCESS,
+            SERVICE_KERNEL_DRIVER,
+            SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL,
+            sysPath,
+            NULL, NULL, NULL, NULL, NULL
+        );
+    }
 
     if (!hService) {
-        hService = OpenServiceW(hSCM, L"MasterXDriver", SERVICE_ALL_ACCESS);
+        CloseServiceHandle(hSCM);
+        return false;
     }
 
-    if (hService) {
-        StartServiceW(hService, 0, NULL);
-        CloseServiceHandle(hService);
+    // Always point the service at our DBK64.sys
+    ChangeServiceConfigW(hService, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
+        SERVICE_ERROR_NORMAL, sysPath, NULL, NULL, NULL, NULL, NULL, DBK_SERVICE_NAME);
+
+    // Stop a running instance so the registry values below are re-read on next start
+    SERVICE_STATUS ss = {};
+    ControlService(hService, SERVICE_CONTROL_STOP, &ss);
+
+    // The driver reads A/B/C/D from its service key at DriverEntry.
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, DBK_SERVICE_REG_KEY, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, L"A", 0, REG_SZ, (const BYTE*)DBK_DEVICE_NAME,     (DWORD)((wcslen(DBK_DEVICE_NAME) + 1) * sizeof(WCHAR)));
+        RegSetValueExW(hKey, L"B", 0, REG_SZ, (const BYTE*)DBK_SYMLINK_NAME,    (DWORD)((wcslen(DBK_SYMLINK_NAME) + 1) * sizeof(WCHAR)));
+        RegSetValueExW(hKey, L"C", 0, REG_SZ, (const BYTE*)DBK_PROCESS_EVENT,   (DWORD)((wcslen(DBK_PROCESS_EVENT) + 1) * sizeof(WCHAR)));
+        RegSetValueExW(hKey, L"D", 0, REG_SZ, (const BYTE*)DBK_THREAD_EVENT,    (DWORD)((wcslen(DBK_THREAD_EVENT) + 1) * sizeof(WCHAR)));
+        RegCloseKey(hKey);
     }
 
+    StartServiceW(hService, 0, NULL);
+
+    CloseServiceHandle(hService);
     CloseServiceHandle(hSCM);
     return true;
 }
@@ -101,7 +173,7 @@ void StopAndUnloadDriver()
     SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!hSCM) return;
 
-    SC_HANDLE hService = OpenServiceW(hSCM, L"MasterXDriver", SERVICE_ALL_ACCESS);
+    SC_HANDLE hService = OpenServiceW(hSCM, DBK_SERVICE_NAME, SERVICE_ALL_ACCESS);
     if (hService) {
         SERVICE_STATUS status;
         ControlService(hService, SERVICE_CONTROL_STOP, &status);
@@ -109,21 +181,86 @@ void StopAndUnloadDriver()
         CloseServiceHandle(hService);
     }
 
+    // Clean the A/B/C/D values from the service key
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, DBK_SERVICE_REG_KEY, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueW(hKey, L"A");
+        RegDeleteValueW(hKey, L"B");
+        RegDeleteValueW(hKey, L"C");
+        RegDeleteValueW(hKey, L"D");
+        RegCloseKey(hKey);
+    }
+
     CloseServiceHandle(hSCM);
 }
 
 bool ConnectDriver()
 {
-    if (g_hDriver != INVALID_HANDLE_VALUE) CloseHandle(g_hDriver);
-    
-    g_hDriver = CreateFileW(L"\\\\.\\Global\\MasterXDriver",
-        GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    
-    if (g_hDriver == INVALID_HANDLE_VALUE) {
-        g_hDriver = CreateFileW(L"\\\\.\\MasterXDriver",
-            GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DisconnectDriver();
+
+    g_hDriver = CreateFileW(DBK_DEVICE_PATH,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+
+    g_DriverConnected = (g_hDriver != INVALID_HANDLE_VALUE);
+    if (g_DriverConnected)
+        DbkGetVersion(&g_KernelVersion);
+
+    return g_DriverConnected;
+}
+
+void DisconnectDriver()
+{
+    if (g_hDriver != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_hDriver);
+        g_hDriver = INVALID_HANDLE_VALUE;
     }
-    return g_hDriver != INVALID_HANDLE_VALUE;
+    g_DriverConnected = false;
+}
+
+// =====================================================================
+//  Low-level DBK64 IOCTL helpers
+// =====================================================================
+bool DbkIoctl(ULONG code, const void* in, ULONG inSize, void* out, ULONG outSize, ULONG* returned)
+{
+    if (g_hDriver == INVALID_HANDLE_VALUE) return false;
+    DWORD br = 0;
+    BOOL ok = DeviceIoControl(g_hDriver, code, (LPVOID)in, inSize, out, outSize, &br, NULL);
+    if (returned) *returned = br;
+    return ok != FALSE;
+}
+
+bool DbkReadBytes(ULONG pid, ULONG_PTR addr, void* out, ULONG size)
+{
+    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0 || size == 0 || size > 0xFFFF || out == NULL)
+        return false;
+
+    DBK_READ_REQUEST req;
+    req.ProcessId = pid;
+    req.Address = addr;
+    req.BytesToRead = (USHORT)size;
+
+    ULONG returned = 0;
+    return DbkIoctl(IOCTL_CE_READMEMORY, &req, sizeof(req), out, size, &returned) && returned == size;
+}
+
+bool DbkWriteBytes(ULONG pid, ULONG_PTR addr, const void* in, ULONG size)
+{
+    if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0 || size == 0 || size > 0xFFFF || in == NULL)
+        return false;
+
+    ULONG total = DBK_WRITE_HEADER_SIZE + size;
+    std::vector<BYTE> buf(total, 0);
+    *(ULONG64*)(&buf[0])  = pid;
+    *(ULONG64*)(&buf[8])  = addr;
+    *(USHORT*)(&buf[16])  = (USHORT)size;
+    memcpy(&buf[DBK_WRITE_HEADER_SIZE], in, size);
+
+    return DbkIoctl(IOCTL_CE_WRITEMEMORY, buf.data(), total, NULL, 0, NULL);
 }
 
 // =====================================================================
@@ -145,31 +282,22 @@ void WriteMemory(ULONG pid, ULONG_PTR addr, ULONG64 val64, int dataType)
 {
     if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0) return;
     ULONG sz = GetDataSize(dataType);
-    MEMORY_REQUEST_V2 req = { pid, addr, sz, val64 };
-    DWORD br = 0;
-    DeviceIoControl(g_hDriver, IOCTL_V2_WRITE_MEMORY, &req, sizeof(req), NULL, 0, &br, NULL);
+    DbkWriteBytes(pid, addr, &val64, sz);
 }
 
 void ReadMemory(ULONG pid, ULONG_PTR addr, ULONG64* outVal, int dataType)
 {
     if (g_hDriver == INVALID_HANDLE_VALUE || pid == 0) { *outVal = 0; return; }
     ULONG sz = GetDataSize(dataType);
-    MEMORY_REQUEST_V2 req = { pid, addr, sz, 0 };
-    DWORD br = 0;
-    DeviceIoControl(g_hDriver, IOCTL_V2_READ_MEMORY, &req, sizeof(req), outVal, sizeof(ULONG64), &br, NULL);
+    ULONG64 v = 0;
+    if (!DbkReadBytes(pid, addr, &v, sz)) v = 0;
+    *outVal = v;
 }
 
 void PatchMemory(ULONG_PTR addr, const UCHAR* pattern, ULONG size)
 {
     if (g_hDriver == INVALID_HANDLE_VALUE || g_SelectedPid == 0 || size == 0 || size > 32) return;
-    PATCH_REQUEST_V2 req = {};
-    req.TargetPid = g_SelectedPid;
-    req.Address = addr;
-    req.Size = size;
-    memcpy(req.Pattern, pattern, size);
-
-    DWORD br = 0;
-    DeviceIoControl(g_hDriver, IOCTL_V2_PATCH_MEMORY, &req, sizeof(req), NULL, 0, &br, NULL);
+    DbkWriteBytes(g_SelectedPid, addr, pattern, size);
 }
 
 ULONG64 ParseInputToValue(const char* str, int dataType) {
@@ -203,7 +331,7 @@ void FormatValueToString(ULONG64 val64, int dataType, char* outBuf, size_t maxLe
         memcpy(&d, &val64, sizeof(double));
         sprintf_s(outBuf, maxLen, "%.2lf", d);
     }
-    else if (dataType == 4) { // 8 Bytes / Int64
+    else if (dataType == 0) { // 8 Bytes / Int64
         sprintf_s(outBuf, maxLen, "%lld", (long long)val64);
     }
     else if (dataType == 3) { // Byte
@@ -220,7 +348,7 @@ void FormatValueToString(ULONG64 val64, int dataType, char* outBuf, size_t maxLe
 // Forward declaration
 static std::vector<LONG> ParseOffsetList(const char* str);
 
-const ModuleInfoV2* FindModuleByAddress(ULONG_PTR addr)
+const ModuleInfo* FindModuleByAddress(ULONG_PTR addr)
 {
     for (const auto& mod : g_LoadedModules) {
         if (addr >= mod.BaseAddress && addr < (mod.BaseAddress + mod.Size))
@@ -237,7 +365,7 @@ ResolvedPointer ResolvePointerSmart(ULONG pid, const char* addressInput, const c
     ULONG_PTR baseAddr = (ULONG_PTR)_strtoui64(addressInput, NULL, 0);
     if (baseAddr == 0) return result;
 
-    const ModuleInfoV2* mod = FindModuleByAddress(baseAddr);
+    const ModuleInfo* mod = FindModuleByAddress(baseAddr);
     if (mod) {
         result.BaseModule = mod->ModuleName;
         result.BaseOffset = baseAddr - mod->BaseAddress;
@@ -259,7 +387,7 @@ ResolvedPointer ResolvePointerSmart(ULONG pid, const char* addressInput, const c
 
         if (i == result.Offsets.size() - 1) {
             result.FinalAddress = (ULONG_PTR)val64 + result.Offsets[i];
-            ReadMemory(pid, result.FinalAddress, &result.FinalValue, 0); // read final value as 8 bytes
+            ReadMemory(pid, result.FinalAddress, &result.FinalValue, 0);
             result.Success = true;
         }
         else {
@@ -332,7 +460,7 @@ ULONG_PTR ResolvePointerPath(ULONG pid, ULONG_PTR baseAddress, const std::vector
     ULONG_PTR currentAddress = baseAddress;
     for (size_t i = 0; i < offsets.size(); ++i) {
         ULONG64 val64 = 0;
-        ReadMemory(pid, currentAddress, &val64, 0); // pointers are always 8 bytes (dataType 0)
+        ReadMemory(pid, currentAddress, &val64, 0);
         if (val64 == 0) return 0;
 
         if (i == offsets.size() - 1) {
@@ -384,6 +512,171 @@ static std::vector<LONG> ParseOffsetList(const char* str)
 }
 
 // =====================================================================
+//  DBK64 feature helpers (Kernel tab)
+// =====================================================================
+bool DbkGetVersion(ULONG* version)
+{
+    if (version) *version = 0;
+    ULONG v = 0;
+    if (DbkIoctl(IOCTL_CE_GETVERSION, NULL, 0, &v, sizeof(v))) {
+        if (version) *version = v;
+        return true;
+    }
+    return false;
+}
+
+bool DbkGetCR0(ULONG64* out)
+{
+    if (out) *out = 0;
+    ULONG64 v = 0;
+    if (DbkIoctl(IOCTL_CE_GETCR0, NULL, 0, &v, sizeof(v))) { if (out) *out = v; return true; }
+    return false;
+}
+
+bool DbkGetCR3(ULONG pid, ULONG64* out)
+{
+    if (out) *out = 0;
+    ULONG inputPid = pid;
+    ULONG64 v = 0;
+    if (DbkIoctl(IOCTL_CE_GETCR3, &inputPid, sizeof(inputPid), &v, sizeof(v))) { if (out) *out = v; return true; }
+    return false;
+}
+
+bool DbkGetCR4(ULONG64* out)
+{
+    if (out) *out = 0;
+    ULONG64 v = 0;
+    if (DbkIoctl(IOCTL_CE_GETCR4, NULL, 0, &v, sizeof(v))) { if (out) *out = v; return true; }
+    return false;
+}
+
+bool DbkReadMsr(ULONG msr, ULONG64* out)
+{
+    if (out) *out = 0;
+    ULONG64 v = 0;
+    if (DbkIoctl(IOCTL_CE_READMSR, &msr, sizeof(msr), &v, sizeof(v))) { if (out) *out = v; return true; }
+    return false;
+}
+
+bool DbkWriteMsr(ULONG64 msr, ULONG64 value)
+{
+    DBK_MSR_WRITE req;
+    req.Msr = msr;
+    req.Value = value;
+    return DbkIoctl(IOCTL_CE_WRITEMSR, &req, sizeof(req), NULL, 0, NULL);
+}
+
+bool DbkGetIdt(USHORT* limit, ULONG_PTR* base)
+{
+    if (limit) *limit = 0;
+    if (base) *base = 0;
+    DBK_SEG_TABLE t = {};
+    if (DbkIoctl(IOCTL_CE_GETIDT, NULL, 0, &t, sizeof(t))) {
+        if (limit) *limit = t.Limit;
+        if (base) *base = t.Base;
+        return true;
+    }
+    return false;
+}
+
+bool DbkGetGdt(USHORT* limit, ULONG_PTR* base)
+{
+    if (limit) *limit = 0;
+    if (base) *base = 0;
+    DBK_SEG_TABLE t = {};
+    if (DbkIoctl(IOCTL_CE_GETGDT, NULL, 0, &t, sizeof(t))) {
+        if (limit) *limit = t.Limit;
+        if (base) *base = t.Base;
+        return true;
+    }
+    return false;
+}
+
+bool DbkReadPhysical(ULONG64 addr, void* out, ULONG size)
+{
+    if (size == 0 || size > 0x2000 || out == NULL) return false;   // driver maps a 0x2000 view
+    DBK_PHYS_RW req;
+    req.Address = addr;
+    req.Bytes = size;
+    return DbkIoctl(IOCTL_CE_READPHYSICALMEMORY, &req, sizeof(req), out, size, NULL);
+}
+
+bool DbkWritePhysical(ULONG64 addr, const void* in, ULONG size)
+{
+    if (size == 0 || size > 0x2000 || in == NULL) return false;
+    ULONG total = sizeof(DBK_PHYS_RW) + size;
+    std::vector<BYTE> buf(total, 0);
+    *(ULONG64*)(&buf[0]) = addr;
+    *(ULONG64*)(&buf[8]) = size;
+    memcpy(&buf[sizeof(DBK_PHYS_RW)], in, size);
+    return DbkIoctl(IOCTL_CE_WRITEPHYSICALMEMORY, buf.data(), total, NULL, 0, NULL);
+}
+
+bool DbkAllocNonPaged(ULONG size, ULONG64* out)
+{
+    if (out) *out = 0;
+    ULONG64 addr = 0;
+    if (DbkIoctl(IOCTL_CE_ALLOCATEMEM_NONPAGED, &size, sizeof(size), &addr, sizeof(addr))) {
+        if (out) *out = addr;
+        return addr != 0;
+    }
+    return false;
+}
+
+bool DbkFreeNonPaged(ULONG64 addr)
+{
+    return DbkIoctl(IOCTL_CE_FREE_NONPAGED, &addr, sizeof(addr), NULL, 0, NULL);
+}
+
+bool DbkAllocProcessMem(ULONG pid, ULONG64 size, ULONG64* out)
+{
+    if (out) *out = 0;
+    DBK_ALLOC_PROCESS req = {};
+    req.ProcessId = pid;
+    req.BaseAddress = 0;
+    req.Size = size;
+    req.AllocationType = 0x3000;             // MEM_COMMIT | MEM_RESERVE
+    req.Protect = 0x40;                      // PAGE_EXECUTE_READWRITE
+    ULONG64 addr = 0;
+    if (DbkIoctl(IOCTL_CE_ALLOCATEMEM, &req, sizeof(req), &addr, sizeof(addr))) {
+        if (out) *out = addr;
+        return addr != 0;
+    }
+    return false;
+}
+
+bool DbkSuspendProcess(ULONG pid)
+{
+    return DbkIoctl(IOCTL_CE_SUSPENDPROCESS, &pid, sizeof(pid), NULL, 0, NULL);
+}
+
+bool DbkResumeProcess(ULONG pid)
+{
+    return DbkIoctl(IOCTL_CE_RESUMEPROCESS, &pid, sizeof(pid), NULL, 0, NULL);
+}
+
+bool DbkOpenProcessHandle(ULONG pid, ULONG64* handle, UCHAR* special)
+{
+    if (handle) *handle = 0;
+    if (special) *special = 0;
+    DBK_OPENPROCESS_OUT out = {};
+    if (DbkIoctl(IOCTL_CE_OPENPROCESS, &pid, sizeof(pid), &out, sizeof(out))) {
+        if (handle) *handle = out.Handle;
+        if (special) *special = out.Special;
+        return true;
+    }
+    return false;
+}
+
+bool DbkGetPEPROCESS(ULONG pid, ULONG64* out)
+{
+    if (out) *out = 0;
+    ULONG64 v = 0;
+    if (DbkIoctl(IOCTL_CE_GETPEPROCESS, &pid, sizeof(pid), &v, sizeof(v))) { if (out) *out = v; return true; }
+    return false;
+}
+
+// =====================================================================
 //  Freeze / Cheat Table Loop
 // =====================================================================
 void FreezeLoop()
@@ -392,8 +685,6 @@ void FreezeLoop()
         if (g_hDriver != INVALID_HANDLE_VALUE) {
             std::lock_guard<std::mutex> lock(g_CheatTableLock);
             for (auto& item : g_CheatTable) {
-                // Each item keeps its own pid/type, so switching the selected
-                // process or data type never corrupts unrelated memory
                 if (item.Enabled && item.Pid != 0) {
                     WriteMemory(item.Pid, item.Address, item.Value64, item.DataType);
                 }
@@ -404,38 +695,102 @@ void FreezeLoop()
 }
 
 // =====================================================================
-//  Process & Module Enumeration
+//  Process & Module Enumeration (user-mode Toolhelp, no driver needed)
 // =====================================================================
 void RefreshProcessList()
 {
-    if (g_hDriver == INVALID_HANDLE_VALUE) return;
-    ULONG br = 0;
-    std::vector<ProcessInfoV2> temp(4096);
-    if (DeviceIoControl(g_hDriver, IOCTL_V2_GET_PROCESS_LIST, NULL, 0, temp.data(), (DWORD)(temp.size() * sizeof(ProcessInfoV2)), &br, NULL)) {
-        ULONG count = br / sizeof(ProcessInfoV2);
-        if (count > 0) {
-            g_ProcessList.assign(temp.begin(), temp.begin() + count);
-        }
+    g_ProcessList.clear();
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            ProcessInfo info;
+            info.ProcessId = pe.th32ProcessID;
+            memset(info.Name, 0, sizeof(info.Name));
+            WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, info.Name, (int)sizeof(info.Name) - 1, NULL, NULL);
+            g_ProcessList.push_back(info);
+        } while (Process32NextW(snap, &pe));
     }
+    CloseHandle(snap);
 }
 
 void RefreshModules()
 {
-    if (g_hDriver == INVALID_HANDLE_VALUE || g_SelectedPid == 0) return;
-    ULONG br = 0;
-    std::vector<ModuleInfoV2> temp(1024);
-    if (DeviceIoControl(g_hDriver, IOCTL_V2_ENUM_MODULES, &g_SelectedPid, sizeof(g_SelectedPid), temp.data(), (DWORD)(temp.size() * sizeof(ModuleInfoV2)), &br, NULL)) {
-        ULONG count = br / sizeof(ModuleInfoV2);
-        g_LoadedModules.assign(temp.begin(), temp.begin() + count);
+    g_LoadedModules.clear();
+    if (g_SelectedPid == 0) return;
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_SelectedPid);
+    if (snap == INVALID_HANDLE_VALUE) return;
+
+    MODULEENTRY32W me;
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            ModuleInfo info;
+            memset(&info, 0, sizeof(info));
+            WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, info.ModuleName, (int)sizeof(info.ModuleName) - 1, NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, info.FullPath, (int)sizeof(info.FullPath) - 1, NULL, NULL);
+            info.BaseAddress = (ULONG_PTR)me.modBaseAddr;
+            info.Size = me.modBaseSize;
+            g_LoadedModules.push_back(info);
+        } while (Module32NextW(snap, &me));
     }
-    else {
-        g_LoadedModules.clear();
-    }
+    CloseHandle(snap);
 }
 
 // =====================================================================
-//  Async Scanning Workers
+//  Memory region enumeration & scanning (regions via VirtualQueryEx,
+//  reads performed through the DBK64 driver)
 // =====================================================================
+struct RegionInfo {
+    ULONG_PTR Start;
+    ULONG_PTR End;
+};
+
+static ULONG_PTR MaxAddr(ULONG_PTR a, ULONG_PTR b) { return a > b ? a : b; }
+static ULONG_PTR MinAddr(ULONG_PTR a, ULONG_PTR b) { return a < b ? a : b; }
+
+static bool IsReadableProtect(DWORD protect)
+{
+    if (protect == 0 || protect == PAGE_NOACCESS) return false;
+    if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+static std::vector<RegionInfo> EnumerateRegions(ULONG pid, ULONG_PTR rangeStart, ULONG_PTR rangeEnd)
+{
+    std::vector<RegionInfo> regions;
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!h) return regions;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR addr = rangeStart;
+    while (addr < rangeEnd) {
+        SIZE_T queried = VirtualQueryEx(h, (LPCVOID)addr, &mbi, sizeof(mbi));
+        if (!queried) break;
+
+        ULONG_PTR regionEnd = (ULONG_PTR)mbi.BaseAddress + (ULONG_PTR)mbi.RegionSize;
+        bool readable = (mbi.State == MEM_COMMIT) && IsReadableProtect(mbi.Protect);
+
+        if (readable) {
+            ULONG_PTR s = MaxAddr((ULONG_PTR)mbi.BaseAddress, rangeStart);
+            ULONG_PTR e = MinAddr(regionEnd, rangeEnd);
+            if (s < e) regions.push_back({ s, e });
+        }
+
+        if (regionEnd <= (ULONG_PTR)mbi.BaseAddress) break; // overflow guard
+        addr = regionEnd;
+    }
+
+    CloseHandle(h);
+    return regions;
+}
+
 void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bool useRange, ULONG_PTR rangeStart, ULONG_PTR rangeEnd, bool allowUnaligned)
 {
     g_IsScanning = true;
@@ -446,28 +801,53 @@ void AsyncFirstScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, bo
         g_ScanResults.clear();
     }
 
-    if (g_hDriver == INVALID_HANDLE_VALUE) {
+    if (g_hDriver == INVALID_HANDLE_VALUE || targetPid == 0) {
         g_IsScanning = false;
         return;
     }
 
-    SCAN_REQUEST_V2 req = { targetPid, (ULONG)dataType, searchVal64, rangeStart, rangeEnd,
-                            (ULONG)(allowUnaligned ? SCAN_FLAG_UNALIGNED : 0) };
-    ULONG br = 0;
-    std::vector<ULONG_PTR> tempResults((size_t)MAX_SCAN_RESULTS + 1); // slot 0 = result flags
+    ULONG sz = GetDataSize(dataType);
+    ULONG_PTR rStart = useRange ? rangeStart : 0x10000;
+    ULONG_PTR rEnd = useRange ? rangeEnd : 0x7FFFFFFFFFFFULL;
 
-    BOOL ok = DeviceIoControl(g_hDriver, IOCTL_V2_FIRST_SCAN, &req, sizeof(req), tempResults.data(), (DWORD)(tempResults.size() * sizeof(ULONG_PTR)), &br, NULL);
-    if (ok && br >= sizeof(ULONG_PTR)) {
-        ULONG totalSlots = br / sizeof(ULONG_PTR);
-        g_ScanTruncated = (tempResults[0] & SCAN_RESULT_TRUNCATED) != 0;
-        std::lock_guard<std::mutex> lock(g_ScanResultsLock);
-        g_ScanResults.assign(tempResults.begin() + 1, tempResults.begin() + totalSlots);
-    }
-    else {
-        std::lock_guard<std::mutex> lock(g_ScanResultsLock);
-        g_ScanResults.clear();
+    std::vector<RegionInfo> regions = EnumerateRegions(targetPid, rStart, rEnd);
+
+    std::vector<ULONG_PTR> results;
+    std::vector<BYTE> chunk(65536);
+    ULONG64 totalBytes = 0, doneBytes = 0;
+    for (auto& r : regions) totalBytes += (ULONG64)(r.End - r.Start);
+
+    for (auto& r : regions) {
+        ULONG_PTR cur = r.Start;
+        while (cur < r.End) {
+            ULONG_PTR remaining = r.End - cur;
+            ULONG chunkSize = (ULONG)MinAddr(remaining, (ULONG_PTR)chunk.size());
+
+            if (DbkReadBytes(targetPid, cur, chunk.data(), chunkSize)) {
+                ULONG maxOff = (chunkSize >= sz) ? (chunkSize - sz + 1) : 0;
+                ULONG step = allowUnaligned ? 1 : sz;
+                for (ULONG off = 0; off < maxOff; off += step) {
+                    if (memcmp(&chunk[off], &searchVal64, sz) == 0) {
+                        results.push_back(cur + off);
+                        if (results.size() >= MAX_SCAN_RESULTS) {
+                            g_ScanTruncated = true;
+                            goto scan_done;
+                        }
+                    }
+                }
+            }
+
+            cur += chunkSize;
+            doneBytes += chunkSize;
+            g_ScanProgress = totalBytes ? (int)(doneBytes * 100 / totalBytes) : 100;
+        }
     }
 
+scan_done:
+    {
+        std::lock_guard<std::mutex> lock(g_ScanResultsLock);
+        g_ScanResults = std::move(results);
+    }
     g_ScanVersion++;
     g_ScanProgress = 100;
     g_IsScanning = false;
@@ -484,32 +864,23 @@ void AsyncNextScanWorker(ULONG targetPid, int dataType, ULONG64 searchVal64, std
         return;
     }
 
-    size_t headerSize = sizeof(NEXT_SCAN_HEADER_V2);
-    size_t dataSize = prevResults.size() * sizeof(ULONG_PTR);
-    std::vector<UCHAR> buffer(headerSize + dataSize);
+    ULONG sz = GetDataSize(dataType);
+    std::vector<ULONG_PTR> results;
+    results.reserve(prevResults.size());
 
-    PNEXT_SCAN_HEADER_V2 hdr = (PNEXT_SCAN_HEADER_V2)buffer.data();
-    hdr->TargetPid = targetPid;
-    hdr->DataType = (ULONG)dataType;
-    hdr->SearchValue64 = searchVal64;
-    hdr->AddressCount = (ULONG)prevResults.size();
-
-    memcpy(buffer.data() + headerSize, prevResults.data(), dataSize);
-
-    ULONG br = 0;
-    std::vector<ULONG_PTR> newResults(prevResults.size());
-
-    BOOL ok = DeviceIoControl(g_hDriver, IOCTL_V2_NEXT_SCAN, buffer.data(), (DWORD)buffer.size(), newResults.data(), (DWORD)(newResults.size() * sizeof(ULONG_PTR)), &br, NULL);
-    if (ok && br >= sizeof(ULONG_PTR)) {
-        ULONG count = br / sizeof(ULONG_PTR);
-        std::lock_guard<std::mutex> lock(g_ScanResultsLock);
-        g_ScanResults.assign(newResults.begin(), newResults.begin() + count);
-    }
-    else {
-        std::lock_guard<std::mutex> lock(g_ScanResultsLock);
-        g_ScanResults.clear();
+    ULONG64 total = (ULONG64)prevResults.size(), done = 0;
+    for (auto a : prevResults) {
+        ULONG64 v = 0;
+        if (DbkReadBytes(targetPid, a, &v, sz) && memcmp(&v, &searchVal64, sz) == 0)
+            results.push_back(a);
+        done++;
+        g_ScanProgress = total ? (int)(done * 100 / total) : 100;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_ScanResultsLock);
+        g_ScanResults = std::move(results);
+    }
     g_ScanVersion++;
     g_ScanProgress = 100;
     g_IsScanning = false;
@@ -519,8 +890,8 @@ void StartFirstScan()
 {
     if (g_SelectedPid == 0 || g_IsScanning) return;
     ULONG64 val64 = ParseInputToValue(g_ScanValueInput, g_SelectedDataType);
-    ULONG_PTR rStart = 0;
-    ULONG_PTR rEnd = 0x7FFFFFFFFFFF;
+    ULONG_PTR rStart = 0x10000;
+    ULONG_PTR rEnd = 0x7FFFFFFFFFFFULL;
     if (g_UseScanRange) {
         rStart = (ULONG_PTR)_strtoui64(g_ScanRangeStart, NULL, 0);
         rEnd = (ULONG_PTR)_strtoui64(g_ScanRangeEnd, NULL, 0);
@@ -560,6 +931,33 @@ void ExportResultsToFile()
 }
 
 // =====================================================================
+//  Kernel tab helpers (UI actions)
+// =====================================================================
+static void FormatPhysDump(const BYTE* data, ULONG size, ULONG64 baseAddr, char* out, size_t outMax)
+{
+    std::stringstream ss;
+    for (ULONG row = 0; row < size; row += 16) {
+        char ascii[17] = "................";
+        ss << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << (baseAddr + row) << "  ";
+
+        ULONG lineLen = (size - row) < 16 ? (size - row) : 16;
+        for (ULONG i = 0; i < 16; i++) {
+            if (i < lineLen) {
+                ss << std::setw(2) << (unsigned)data[row + i] << " ";
+                BYTE c = data[row + i];
+                if (c >= 0x20 && c < 0x7F) ascii[i] = (char)c;
+            }
+            else {
+                ss << "   ";
+            }
+        }
+        ss << " |" << ascii << "|";
+        if (row + 16 < size) ss << "\n";
+    }
+    strncpy_s(out, outMax, ss.str().c_str(), _TRUNCATE);
+}
+
+// =====================================================================
 //  WinMain / Entry Point
 // =====================================================================
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
@@ -569,16 +967,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     UNREFERENCED_PARAMETER(lpCmdLine);
     UNREFERENCED_PARAMETER(nCmdShow);
 
+    EnableSeDebugPrivilege();
+
     LoadAndStartDriver();
     bool driverConnected = ConnectDriver();
     if (!driverConnected) {
-        MessageBoxA(NULL, "Failed to connect to MasterXDriver! Run as Administrator.", "Warning", MB_OK | MB_ICONWARNING);
+        MessageBoxA(NULL, "Failed to connect to DBK64 (DBKKernel driver)!\nRun as Administrator and make sure DBK64.sys is next to the exe.",
+            "Warning", MB_OK | MB_ICONWARNING);
     }
 
     if (!glfwInit()) return 1;
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "MasterX Suite v2.0 - Ultimate Kernel Engine", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "Imno - DBK64 Kernel Suite", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return 1;
@@ -639,9 +1040,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     ImGui_ImplGlfw_InitForOther(window, true);
     ImGui_ImplDX11_Init(pd3dDevice, pd3dDeviceContext);
 
-    // Initial fetch of processes
+    // Initial fetch of processes & kernel info
     if (driverConnected) {
         RefreshProcessList();
+        DbkGetVersion(&g_KernelVersion);
     }
 
     g_FreezeThread = std::thread(FreezeLoop);
@@ -676,19 +1078,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         ImGui::NewFrame();
 
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-        // Use framebuffer size for ImGui window so it matches SwapChain (fix DPI / resize mismatch)
         ImGui::SetNextWindowSize(ImVec2((float)fbWidth, (float)fbHeight), ImGuiCond_Always);
-        ImGui::Begin("MasterX Suite v2.0", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
+        ImGui::Begin("Imno - DBK64 Kernel Suite", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
 
         // Top Bar: Driver Status Active/Inactive & Process Combo
         driverConnected = (g_hDriver != INVALID_HANDLE_VALUE);
         if (driverConnected) {
-            ImGui::TextColored({ 0.0f, 1.0f, 0.0f, 1.0f }, "[Driver: ACTIVE]");
+            ImGui::TextColored({ 0.0f, 1.0f, 0.0f, 1.0f }, "[DBK64 Driver: ACTIVE]");
         }
         else {
-            ImGui::TextColored({ 1.0f, 0.0f, 0.0f, 1.0f }, "[Driver: INACTIVE]");
+            ImGui::TextColored({ 1.0f, 0.0f, 0.0f, 1.0f }, "[DBK64 Driver: INACTIVE]");
             ImGui::SameLine();
             if (ImGui::Button("Reconnect")) {
+                LoadAndStartDriver();
                 driverConnected = ConnectDriver();
                 if (driverConnected) RefreshProcessList();
             }
@@ -738,7 +1140,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         ImGui::Separator();
 
         // Tabs
-        if (ImGui::BeginTabBar("MasterXTabs"))
+        if (ImGui::BeginTabBar("ImnoTabs"))
         {
             // TAB 1: MEMORY SCANNER
             if (ImGui::BeginTabItem("Memory Scanner"))
@@ -788,14 +1190,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 }
 
                 if (g_IsScanning) {
-                    ImGui::ProgressBar((float)g_ScanProgress / 100.0f, ImVec2(-1, 0), "Scanning Kernel Memory...");
+                    ImGui::ProgressBar((float)g_ScanProgress / 100.0f, ImVec2(-1, 0), "Scanning Process Memory (kernel reads)...");
                 }
 
                 ImGui::Spacing();
                 ImGui::Separator();
 
-                // UI-side snapshot of the scan results: refreshed only when a scan
-                // finishes, so the render loop never touches the worker's vector
+                // UI-side snapshot of the scan results
                 static std::vector<ULONG_PTR> s_DisplayAddrs;
                 static std::vector<ULONG64>   s_DisplayVals;
                 static unsigned               s_DisplayVersion = 0xFFFFFFFF;
@@ -818,8 +1219,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
                 ImGui::BeginChild("ResultsChild", ImVec2(0, 350), true);
                 {
-                    // Only the visible rows are read (and at most ~2x per second),
-                    // instead of thousands of IOCTLs every frame
                     bool doRefresh = !g_IsScanning &&
                         (s_NeedValueRefresh || (GetTickCount64() - s_LastValueRefresh > 400));
 
@@ -990,6 +1389,161 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 ImGui::EndTabItem();
             }
 
+            // TAB 5: KERNEL (DBK64 full feature set)
+            if (ImGui::BeginTabItem("Kernel"))
+            {
+                ImGui::BeginChild("KernelChild", ImVec2(0, 0), false);
+
+                if (ImGui::CollapsingHeader("Driver Info", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Text("Driver version: %u (expected %u)", g_KernelVersion, DBK_VERSION_EXPECTED);
+                    if (ImGui::Button("Re-read version", ImVec2(140, 24))) {
+                        DbkGetVersion(&g_KernelVersion);
+                    }
+                }
+
+                if (ImGui::CollapsingHeader("Control Registers", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (ImGui::Button("Read CR0/CR3/CR4", ImVec2(140, 24))) {
+                        DbkGetCR0(&g_KernelCR0);
+                        DbkGetCR4(&g_KernelCR4);
+                        DbkGetCR3(g_SelectedPid ? g_SelectedPid : GetCurrentProcessId(), &g_KernelCR3);
+                    }
+                    ImGui::Text("CR0: 0x%llX", g_KernelCR0);
+                    ImGui::Text("CR3: 0x%llX (selected process)", g_KernelCR3);
+                    ImGui::Text("CR4: 0x%llX", g_KernelCR4);
+                }
+
+                if (ImGui::CollapsingHeader("MSR (Model Specific Registers)")) {
+                    ImGui::SetNextItemWidth(200);
+                    ImGui::InputText("MSR index", g_MsrReadInput, sizeof(g_MsrReadInput));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Read MSR", ImVec2(90, 24))) {
+                        ULONG msr = (ULONG)_strtoui64(g_MsrReadInput, NULL, 0);
+                        DbkReadMsr(msr, &g_KernelMsrValue);
+                    }
+                    ImGui::Text("Read value: 0x%llX", g_KernelMsrValue);
+
+                    ImGui::Separator();
+                    ImGui::SetNextItemWidth(200);
+                    ImGui::InputText("MSR index", g_MsrWriteMsr, sizeof(g_MsrWriteMsr));
+                    ImGui::SetNextItemWidth(200);
+                    ImGui::InputText("New value", g_MsrWriteValue, sizeof(g_MsrWriteValue));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Write MSR", ImVec2(90, 24))) {
+                        ULONG64 msr = _strtoui64(g_MsrWriteMsr, NULL, 0);
+                        ULONG64 val = _strtoui64(g_MsrWriteValue, NULL, 0);
+                        if (DbkWriteMsr(msr, val))
+                            strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "MSR written OK");
+                        else
+                            strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "MSR write failed");
+                    }
+                    if (g_KernelStatus[0]) ImGui::Text("%s", g_KernelStatus);
+                }
+
+                if (ImGui::CollapsingHeader("IDT / GDT")) {
+                    if (ImGui::Button("Read IDT & GDT", ImVec2(140, 24))) {
+                        DbkGetIdt(&g_KernelIdt.Limit, &g_KernelIdt.Base);
+                        DbkGetGdt(&g_KernelGdt.Limit, &g_KernelGdt.Base);
+                    }
+                    ImGui::Text("IDT: limit 0x%X, base 0x%llX", g_KernelIdt.Limit, g_KernelIdt.Base);
+                    ImGui::Text("GDT: limit 0x%X, base 0x%llX", g_KernelGdt.Limit, g_KernelGdt.Base);
+                }
+
+                if (ImGui::CollapsingHeader("Physical Memory")) {
+                    ImGui::SetNextItemWidth(200);
+                    ImGui::InputText("Physical address", g_PhysReadAddr, sizeof(g_PhysReadAddr));
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::InputText("Bytes", g_PhysReadSize, sizeof(g_PhysReadSize));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Read Physical", ImVec2(110, 24))) {
+                        ULONG64 addr = _strtoui64(g_PhysReadAddr, NULL, 0);
+                        ULONG size = (ULONG)_strtoui64(g_PhysReadSize, NULL, 0);
+                        if (size > 0x2000) size = 0x2000;
+                        std::vector<BYTE> buf(size ? size : 0x100);
+                        if (DbkReadPhysical(addr, buf.data(), (ULONG)buf.size()))
+                            FormatPhysDump(buf.data(), (ULONG)buf.size(), addr, g_PhysReadDump, sizeof(g_PhysReadDump));
+                        else
+                            strcpy_s(g_PhysReadDump, sizeof(g_PhysReadDump), "Physical read failed");
+                    }
+                    ImGui::TextWrapped("%s", g_PhysReadDump);
+
+                    ImGui::Separator();
+                    ImGui::SetNextItemWidth(200);
+                    ImGui::InputText("Physical address", g_PhysWriteAddr, sizeof(g_PhysWriteAddr));
+                    ImGui::SetNextItemWidth(340);
+                    ImGui::InputText("Hex bytes (0x90, 0x90 ...)", g_PhysWriteHex, sizeof(g_PhysWriteHex));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Write Physical", ImVec2(110, 24))) {
+                        ULONG64 addr = _strtoui64(g_PhysWriteAddr, NULL, 0);
+                        UCHAR bytes[512];
+                        ULONG count = 0;
+                        if (ParseHexBytes(g_PhysWriteHex, bytes, sizeof(bytes), &count) && count <= 0x2000) {
+                            if (DbkWritePhysical(addr, bytes, count))
+                                strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "Physical write OK");
+                            else
+                                strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "Physical write failed");
+                        }
+                    }
+                }
+
+                if (ImGui::CollapsingHeader("Kernel Memory Allocation")) {
+                    ImGui::SetNextItemWidth(200);
+                    ImGui::InputText("Nonpaged size", g_AllocNonPagedSize, sizeof(g_AllocNonPagedSize));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Allocate kernel", ImVec2(120, 24))) {
+                        ULONG size = (ULONG)_strtoui64(g_AllocNonPagedSize, NULL, 0);
+                        DbkAllocNonPaged(size, &g_AllocNonPagedAddr);
+                    }
+                    ImGui::Text("Kernel addr: 0x%llX", g_AllocNonPagedAddr);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Free kernel", ImVec2(90, 24)) && g_AllocNonPagedAddr) {
+                        DbkFreeNonPaged(g_AllocNonPagedAddr);
+                        g_AllocNonPagedAddr = 0;
+                    }
+
+                    ImGui::Separator();
+                    ImGui::SetNextItemWidth(200);
+                    ImGui::InputText("Process alloc size", g_AllocProcessSize, sizeof(g_AllocProcessSize));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Allocate in process", ImVec2(140, 24)) && g_SelectedPid != 0) {
+                        ULONG64 size = _strtoui64(g_AllocProcessSize, NULL, 0);
+                        DbkAllocProcessMem(g_SelectedPid, size, &g_AllocProcessAddr);
+                    }
+                    ImGui::Text("Process addr: 0x%llX", g_AllocProcessAddr);
+                }
+
+                if (ImGui::CollapsingHeader("Process Control")) {
+                    if (ImGui::Button("Suspend Process", ImVec2(130, 24)) && g_SelectedPid != 0) {
+                        if (DbkSuspendProcess(g_SelectedPid))
+                            strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "Process suspended");
+                        else
+                            strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "Suspend failed");
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Resume Process", ImVec2(130, 24)) && g_SelectedPid != 0) {
+                        if (DbkResumeProcess(g_SelectedPid))
+                            strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "Process resumed");
+                        else
+                            strcpy_s(g_KernelStatus, sizeof(g_KernelStatus), "Resume failed");
+                    }
+
+                    ImGui::Separator();
+                    if (ImGui::Button("Open kernel handle", ImVec2(140, 24)) && g_SelectedPid != 0) {
+                        UCHAR special = 0;
+                        DbkOpenProcessHandle(g_SelectedPid, &g_OpenProcessHandle, &special);
+                    }
+                    ImGui::Text("Kernel handle: 0x%llX", g_OpenProcessHandle);
+
+                    ImGui::Separator();
+                    if (ImGui::Button("Get PEPROCESS", ImVec2(140, 24)) && g_SelectedPid != 0) {
+                        DbkGetPEPROCESS(g_SelectedPid, &g_PeProcess);
+                    }
+                    ImGui::Text("PEPROCESS: 0x%llX", g_PeProcess);
+                }
+
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
 
@@ -999,7 +1553,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         const float clear_color[4] = { 0.08f, 0.08f, 0.10f, 1.00f };
         pd3dDeviceContext->OMSetRenderTargets(1, &mainRenderTargetView, NULL);
         pd3dDeviceContext->ClearRenderTargetView(mainRenderTargetView, clear_color);
-        // Ensure viewport covers new framebuffer size
         D3D11_VIEWPORT vp{};
         vp.Width = (FLOAT)fbWidth;
         vp.Height = (FLOAT)fbHeight;
@@ -1029,6 +1582,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     glfwDestroyWindow(window);
     glfwTerminate();
 
+    DisconnectDriver();
     StopAndUnloadDriver();
 
     return 0;

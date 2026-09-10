@@ -1,3 +1,0 @@
-D:\project\King\x64\Debug\glfw3.dll
-D:\project\King\x64\Debug\Zydis.dll
-D:\project\King\Imno\x64\Debug\Imno.vcxproj.CopyComplete

@@ -50,6 +50,15 @@ ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
 StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\DBK64.sys
+AddReg         = DBK64_Service_AddReg
+
+; DBK64 reads these four values from its service key at DriverEntry:
+;   A = device object name, B = symbolic link, C/D = process/thread event names.
+[DBK64_Service_AddReg]
+HKR,, "A", 0x00000000, "\Device\DBK64"
+HKR,, "B", 0x00000000, "\DosDevices\DBK64"
+HKR,, "C", 0x00000000, "\BaseNamedObjects\DBKProcList"
+HKR,, "D", 0x00000000, "\BaseNamedObjects\DBKThreadList"
 
 ;
 ;--- DBK64_Device Coinstaller installation ------

@@ -50,6 +50,15 @@ ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
 StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\DBK32.sys
+AddReg         = DBK32_Service_AddReg
+
+; DBK32 reads these four values from its service key at DriverEntry:
+;   A = device object name, B = symbolic link, C/D = process/thread event names.
+[DBK32_Service_AddReg]
+HKR,, "A", 0x00000000, "\Device\DBK32"
+HKR,, "B", 0x00000000, "\DosDevices\DBK32"
+HKR,, "C", 0x00000000, "\BaseNamedObjects\DBKProcList"
+HKR,, "D", 0x00000000, "\BaseNamedObjects\DBKThreadList"
 
 ;
 ;--- DBK32_Device Coinstaller installation ------

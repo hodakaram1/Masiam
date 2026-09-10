@@ -42,6 +42,8 @@ std::atomic<bool>      g_IsScanning(false);
 std::atomic<int>       g_ScanProgress(0);
 std::atomic<bool>      g_ScanTruncated(false);
 std::atomic<unsigned>  g_ScanVersion(0);    // bumped whenever results change
+int                    g_ResultsDataType = 4; // data type of the results currently shown
+bool                   g_SelectedIs64 = true; // bitness of the selected target process
 
 // Cheat Table & Freeze
 std::vector<CheatItem> g_CheatTable;
@@ -357,19 +359,95 @@ const ModuleInfo* FindModuleByAddress(ULONG_PTR addr)
     return nullptr;
 }
 
+bool IsTarget64Bit(ULONG pid)
+{
+    if (pid == 0) return true;
+
+    // 1) Accurate: ask the OS via a limited-information handle.
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h) {
+        BOOL wow64 = FALSE;
+        BOOL ok = IsWow64Process(h, &wow64);
+        CloseHandle(h);
+        if (ok) return !wow64; // not WOW64 => native 64-bit
+    }
+
+    // 2) Fallback: a WOW64 process exposes 32-bit modules; a native one has none.
+    //    Toolhelp snapshots work without opening the target process.
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE32, pid);
+    if (snap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me;
+        me.dwSize = sizeof(me);
+        BOOL has32 = Module32FirstW(snap, &me);
+        CloseHandle(snap);
+        if (has32) return false;
+    }
+
+    // 3) Default (e.g. protected system processes that can't be opened): native.
+    return true;
+}
+
+ULONG GetPointerSize(ULONG pid)
+{
+    return IsTarget64Bit(pid) ? 8 : 4;
+}
+
+// Normalizes "C:\path\foo.exe" / "foo.exe" / "FOO.EXE" -> "foo"
+static std::string ModuleBaseName(const std::string& name)
+{
+    std::string base = name;
+    size_t slash = base.find_last_of("\\/");
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    size_t dot = base.rfind('.');
+    if (dot != std::string::npos) base = base.substr(0, dot);
+    return base;
+}
+
+ULONG_PTR ParseAddressInput(const char* str)
+{
+    if (!str || !*str) return 0;
+
+    // Find the last '+'/'-' after the first character (module<op>offset syntax).
+    const char* sep = nullptr;
+    char op = 0;
+    for (const char* p = str + 1; *p; ++p) {
+        if (*p == '+' || *p == '-') { sep = p; op = *p; }
+    }
+
+    if (!sep)
+        return (ULONG_PTR)_strtoui64(str, NULL, 0); // raw hex / decimal
+
+    std::string modName(str, sep - str);
+    while (!modName.empty() && (modName.back() == ' ' || modName.back() == '\t'))
+        modName.pop_back();
+
+    ULONG_PTR off = (ULONG_PTR)_strtoui64(sep + 1, NULL, 0);
+    if (modName.empty())
+        return (ULONG_PTR)_strtoui64(str, NULL, 0); // e.g. just "-0x10": treat as raw
+
+    std::string want = ModuleBaseName(modName);
+    for (const auto& m : g_LoadedModules) {
+        if (_stricmp(want.c_str(), ModuleBaseName(m.ModuleName).c_str()) == 0) {
+            ULONG_PTR base = m.BaseAddress;
+            return op == '-' ? base - off : base + off;
+        }
+    }
+
+    return 0; // module not found
+}
+
 ResolvedPointer ResolvePointerSmart(ULONG pid, const char* addressInput, const char* offsetsInput)
 {
     ResolvedPointer result;
     if (pid == 0) return result;
 
-    ULONG_PTR baseAddr = (ULONG_PTR)_strtoui64(addressInput, NULL, 0);
+    ULONG_PTR baseAddr = ParseAddressInput(addressInput);
     if (baseAddr == 0) return result;
 
     const ModuleInfo* mod = FindModuleByAddress(baseAddr);
     if (mod) {
         result.BaseModule = mod->ModuleName;
         result.BaseOffset = baseAddr - mod->BaseAddress;
-        baseAddr = mod->BaseAddress + result.BaseOffset;
     }
     else {
         result.BaseModule = "Unknown";
@@ -379,15 +457,20 @@ ResolvedPointer ResolvePointerSmart(ULONG pid, const char* addressInput, const c
     result.Offsets = ParseOffsetList(offsetsInput);
     if (result.Offsets.empty()) return result;
 
+    // 32-bit targets use 4-byte pointers, 64-bit targets use 8-byte pointers.
+    ULONG ptrSize = GetPointerSize(pid);
+
     ULONG_PTR current = baseAddr;
     for (size_t i = 0; i < result.Offsets.size(); ++i) {
         ULONG64 val64 = 0;
-        ReadMemory(pid, current, &val64, 0); // pointers are 8 bytes
-        if (val64 == 0) return result;
+        if (!DbkReadBytes(pid, current, &val64, ptrSize) || val64 == 0)
+            return result;
 
         if (i == result.Offsets.size() - 1) {
             result.FinalAddress = (ULONG_PTR)val64 + result.Offsets[i];
-            ReadMemory(pid, result.FinalAddress, &result.FinalValue, 0);
+            ULONG64 fv = 0;
+            DbkReadBytes(pid, result.FinalAddress, &fv, ptrSize);
+            result.FinalValue = fv;
             result.Success = true;
         }
         else {
@@ -422,12 +505,18 @@ std::string GetZydisDisassembledBytes(ULONG_PTR targetAddr, ULONG instructionCou
     UCHAR codeBuffer[64] = { 0 };
     for (ULONG offset = 0; offset < 64; offset += 8) {
         ULONG64 val = 0;
-        ReadMemory(g_SelectedPid, targetAddr + offset, &val, 5);
+        DbkReadBytes(g_SelectedPid, targetAddr + offset, &val, 8);
         memcpy(codeBuffer + offset, &val, 8);
     }
 
+    // 64-bit targets decode as long-mode 64-bit; 32-bit (WOW64) targets as
+    // long-mode compatibility 32-bit, otherwise instructions are mis-decoded.
+    bool is64 = IsTarget64Bit(g_SelectedPid);
+    ZydisMachineMode mode = is64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LONG_COMPAT_32;
+    ZydisStackWidth stackWidth = is64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32;
+
     ZydisDecoder decoder;
-    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    ZydisDecoderInit(&decoder, mode, stackWidth);
 
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
@@ -457,11 +546,12 @@ ULONG_PTR ResolvePointerPath(ULONG pid, ULONG_PTR baseAddress, const std::vector
 {
     if (pid == 0 || baseAddress == 0) return 0;
 
+    ULONG ptrSize = GetPointerSize(pid);
     ULONG_PTR currentAddress = baseAddress;
     for (size_t i = 0; i < offsets.size(); ++i) {
         ULONG64 val64 = 0;
-        ReadMemory(pid, currentAddress, &val64, 0);
-        if (val64 == 0) return 0;
+        if (!DbkReadBytes(pid, currentAddress, &val64, ptrSize) || val64 == 0)
+            return 0;
 
         if (i == offsets.size() - 1) {
             return (ULONG_PTR)val64 + offsets[i];
@@ -956,6 +1046,7 @@ void StartFirstScan()
 {
     if (g_SelectedPid == 0 || g_IsScanning) return;
     ULONG64 val64 = ParseInputToValue(g_ScanValueInput, g_SelectedDataType);
+    g_ResultsDataType = g_SelectedDataType;
     ULONG_PTR rStart = 0x10000;
     ULONG_PTR rEnd = 0x7FFFFFFFFFFFULL;
     if (g_UseScanRange) {
@@ -977,6 +1068,7 @@ void StartNextScan()
     if (currentCopy.empty()) return;
 
     ULONG64 val64 = ParseInputToValue(g_ScanValueInput, g_SelectedDataType);
+    g_ResultsDataType = g_SelectedDataType;
     std::thread(AsyncNextScanWorker, g_SelectedPid, g_SelectedDataType, val64, currentCopy).detach();
 }
 
@@ -1038,8 +1130,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     LoadAndStartDriver();
     bool driverConnected = ConnectDriver();
     if (!driverConnected) {
-        MessageBoxA(NULL, "Failed to connect to DBK64 (DBKKernel driver)!\nRun as Administrator and make sure DBK64.sys is next to the exe.",
-            "Warning", MB_OK | MB_ICONWARNING);
+        MessageBoxA(NULL,
+            "Failed to connect to the DBK64 kernel driver!\n\n"
+            "Make sure:\n"
+            "  - You run Imno as Administrator\n"
+            "  - DBK64.sys is in the same folder as Imno.exe\n"
+            "  - Test signing is enabled (admin cmd: bcdedit /set testsigning on)\n"
+            "    and the PC was rebooted afterwards",
+            "DBK64 driver not available", MB_OK | MB_ICONWARNING);
     }
 
     if (!glfwInit()) return 1;
@@ -1191,6 +1289,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 bool isSelected = (g_SelectedPid == p.ProcessId);
                 if (ImGui::Selectable(label, isSelected)) {
                     g_SelectedPid = p.ProcessId;
+                    g_SelectedIs64 = IsTarget64Bit(p.ProcessId);
                     RefreshModules();
                 }
                 if (isSelected) ImGui::SetItemDefaultFocus();
@@ -1201,6 +1300,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         ImGui::SameLine();
         if (g_SelectedPid != 0) {
             ImGui::TextColored({ 0.0f, 1.0f, 0.0f, 1.0f }, "PID: %u", g_SelectedPid);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%s)", g_SelectedIs64 ? "64-bit" : "32-bit");
         }
 
         ImGui::Separator();
@@ -1294,18 +1395,18 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                     {
                         for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
                             if (doRefresh) {
-                                ReadMemory(g_SelectedPid, s_DisplayAddrs[i], &s_DisplayVals[i], g_SelectedDataType);
+                                ReadMemory(g_SelectedPid, s_DisplayAddrs[i], &s_DisplayVals[i], g_ResultsDataType);
                             }
 
                             char valStr[64];
-                            FormatValueToString(s_DisplayVals[i], g_SelectedDataType, valStr, sizeof(valStr));
+                            FormatValueToString(s_DisplayVals[i], g_ResultsDataType, valStr, sizeof(valStr));
 
                             char label[160];
                             sprintf_s(label, sizeof(label), "0x%llX : %s##res%d", s_DisplayAddrs[i], valStr, i);
                             if (ImGui::Selectable(label)) {
                                 std::lock_guard<std::mutex> lock(g_CheatTableLock);
                                 std::string autoDesc = GetAutoOffsetForAddress(s_DisplayAddrs[i]);
-                                g_CheatTable.push_back({ s_DisplayAddrs[i], s_DisplayVals[i], false, g_SelectedDataType, g_SelectedPid, "" });
+                                g_CheatTable.push_back({ s_DisplayAddrs[i], s_DisplayVals[i], false, g_ResultsDataType, g_SelectedPid, "" });
                                 strcpy_s(g_CheatTable.back().Description, sizeof(g_CheatTable.back().Description), autoDesc.c_str());
                             }
                         }
@@ -1395,7 +1496,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 ImGui::InputText("##patchaddr", g_PatchAddressInput, sizeof(g_PatchAddressInput));
                 ImGui::SameLine();
                 if (ImGui::Button("Read Bytes", ImVec2(110, 25)) && g_SelectedPid != 0) {
-                    ULONG_PTR addr = (ULONG_PTR)_strtoui64(g_PatchAddressInput, NULL, 0);
+                    ULONG_PTR addr = ParseAddressInput(g_PatchAddressInput);
                     if (addr) {
                         std::string bytes = GetZydisDisassembledBytes(addr, 1);
                         strcpy_s(g_PatchPatternInput, sizeof(g_PatchPatternInput), bytes.c_str());
@@ -1406,7 +1507,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 ImGui::InputText("##patchpattern", g_PatchPatternInput, sizeof(g_PatchPatternInput));
                 ImGui::SameLine();
                 if (ImGui::Button("Patch Memory", ImVec2(120, 25)) && g_SelectedPid != 0) {
-                    ULONG_PTR addr = (ULONG_PTR)_strtoui64(g_PatchAddressInput, NULL, 0);
+                    ULONG_PTR addr = ParseAddressInput(g_PatchAddressInput);
                     UCHAR bytes[32];
                     ULONG byteCount = 0;
                     if (addr && ParseHexBytes(g_PatchPatternInput, bytes, sizeof(bytes), &byteCount)) {

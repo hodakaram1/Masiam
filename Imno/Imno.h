@@ -221,6 +221,12 @@ void WriteMemory(ULONG pid, ULONG_PTR addr, ULONG64 val64, int dataType);
 void ReadMemory(ULONG pid, ULONG_PTR addr, ULONG64* outVal, int dataType);
 void PatchMemory(ULONG_PTR addr, const UCHAR* pattern, ULONG size);
 
+// Process bitness / pointer size (32-bit targets use 4-byte pointers)
+bool IsTarget64Bit(ULONG pid);
+ULONG GetPointerSize(ULONG pid);
+// Parses "module.exe+0x123", "module.exe-0x10" or a raw "0x..." / decimal address.
+ULONG_PTR ParseAddressInput(const char* str);
+
 ULONG64 ParseInputToValue(const char* str, int dataType);
 void FormatValueToString(ULONG64 val64, int dataType, char* outBuf, size_t maxLen);
 ULONG_PTR ResolvePointerPath(ULONG pid, ULONG_PTR baseAddress, const std::vector<LONG>& offsets);

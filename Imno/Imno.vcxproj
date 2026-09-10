@@ -122,11 +122,6 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
-    <PostBuildEvent>
-      <Command>if exist "$(SolutionDir)DBKKernel\$(Platform)\$(Configuration)\DBK64.sys" copy /Y "$(SolutionDir)DBKKernel\$(Platform)\$(Configuration)\DBK64.sys" "$(OutDir)"
-if exist "$(SolutionDir)$(Platform)\$(Configuration)\DBK64.sys" copy /Y "$(SolutionDir)$(Platform)\$(Configuration)\DBK64.sys" "$(OutDir)"</Command>
-      <Message>Copying DBK64.sys next to Imno.exe</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -143,11 +138,6 @@ if exist "$(SolutionDir)$(Platform)\$(Configuration)\DBK64.sys" copy /Y "$(Solut
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
-    <PostBuildEvent>
-      <Command>if exist "$(SolutionDir)DBKKernel\$(Platform)\$(Configuration)\DBK64.sys" copy /Y "$(SolutionDir)DBKKernel\$(Platform)\$(Configuration)\DBK64.sys" "$(OutDir)"
-if exist "$(SolutionDir)$(Platform)\$(Configuration)\DBK64.sys" copy /Y "$(SolutionDir)$(Platform)\$(Configuration)\DBK64.sys" "$(OutDir)"</Command>
-      <Message>Copying DBK64.sys next to Imno.exe</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />

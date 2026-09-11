@@ -241,25 +241,18 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>RELEASE;TOBESIGNED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Release build WITHOUT the TOBESIGNED self-check: the self-check requires
+           the controlling process to be signed with Dark Byte's key, which Imno is
+           not. Loading the unsigned driver still needs test signing on the machine. -->
+      <PreprocessorDefinitions>RELEASE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <FavorSizeOrSpeed>Neither</FavorSizeOrSpeed>
       <Optimization>Disabled</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(DDK_LIB_PATH)ksecdd.lib;$(DDK_LIB_PATH)Ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(DDK_LIB_PATH)Ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
-    <PostBuildEvent>
-      <Command>"$(WDKBinRoot_x64)\signtool.exe" sign /a /ac "$(TargetDir)..\release\sig\GlobalSign Root CA.crt" /tr http://rfc3161timestamp.globalsign.com/advanced /td SHA256 "$(TargetPath)"
-cd $(MSBuildProjectDirectory)\$(Inf2CatSource)
-copy ..\dbk64.pdb .
-makecab /f "$(ProjectDir)\dbk64.ddf"
-"$(DriverSignToolPath)signtool.exe" sign /v /a /ac "..\..\release\sig\GlobalSign Root CA.crt" /tr http://rfc3161timestamp.globalsign.com/advanced /td SHA256 disk1\dbk64.cab</Command>
-    </PostBuildEvent>
-    <PostBuildEvent>
-      <Message>Generate and sign CAB</Message>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release without sig|x64'">
     <ClCompile>
@@ -323,7 +316,7 @@ makecab /f "$(ProjectDir)\dbk64.ddf"
     <ClCompile Include="processlist.c" />
     <ClCompile Include="sigcheck.c">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release without sig|x64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>

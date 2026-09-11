@@ -14,8 +14,10 @@ pointer resolver, and a DBK64 kernel feature tab) backed by the `DBKKernel`
   - **GLFW** `3.3.9`
   - **Zydis** `v4.1.0` + **Zycore** `v1.5.0`
 - `King.sln` — solution that builds `DBKKernel` then `Imno` (Imno depends on
-  DBKKernel). `build.bat` builds the Debug x64 configuration and logs errors to
-  `build_error.log`.
+  DBKKernel). `build.bat` builds the Release x64 configuration (default) and
+  logs errors to `build_error.log`. The driver's Release config builds
+  **without** the `TOBESIGNED` self-check, so the unsigned driver still loads
+  under test signing.
 
 ## How Imno loads the driver
 
@@ -28,7 +30,7 @@ On startup, `Imno` (run as **Administrator**):
    `HKLM\SYSTEM\CurrentControlSet\Services\DBK64`.
 3. Opens `\\.\DBK64` and issues the IOCTLs.
 
-Both projects output to `<repo>\x64\Debug\`, so `DBK64.sys` lands next to
+Both projects output to `<repo>\x64\Release\`, so `DBK64.sys` lands next to
 `Imno.exe` automatically (no copy step needed).
 
 ## Requirements to build
@@ -46,9 +48,10 @@ Zydis and Zycore straight from the vendored sources.
 ## Building
 
 ```
-build.bat            # Debug x64, writes errors to build_error.log
+build.bat            # Release x64 (default), writes errors to build_error.log
+build.bat Debug      # Debug x64 if you need it
 ```
-or open `King.sln` in Visual Studio, set **Debug | x64**, and build.
+or open `King.sln` in Visual Studio, set **Release | x64**, and build.
 
 ## Running
 
@@ -65,6 +68,7 @@ or open `King.sln` in Visual Studio, set **Debug | x64**, and build.
   (`IOCTL_CE_QUERY_VIRTUAL_MEMORY`), so it works on protected processes
   (e.g. `svchost`/PPL) and on guarded 32-bit games. Pointers for 32-bit targets
   are resolved as 4-byte pointers automatically.
-- Release configurations of the driver enable `TOBESIGNED` (signature
-  self-check) — use the Debug configuration unless you have a signing
-  certificate.
+- The driver's Release configuration is built **without** `TOBESIGNED` (the
+  Dark Byte signature self-check), because `Imno.exe` is not signed with Dark
+  Byte's key. If you ever obtain a signing certificate you can re-enable it in
+  `DBKKernel/DBKKernel.vcxproj`.

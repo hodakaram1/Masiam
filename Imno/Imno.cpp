@@ -1,4 +1,5 @@
 #include "Imno.h"
+#include "CEServer.h"
 
 // Direct Link Libraries for D3D11 & DXGI
 #pragma comment(lib, "d3d11.lib")
@@ -60,6 +61,9 @@ ResolvedPointer g_LastResolved = {};
 
 char g_PatchAddressInput[128] = "";
 char g_PatchPatternInput[128] = "0x90, 0x90";
+
+// CoServer (CEServer bridge) tab state
+char      g_CoServerPort[16] = "52736";
 
 // Kernel tab state
 ULONG     g_KernelVersion = 0;
@@ -1711,6 +1715,70 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 ImGui::EndTabItem();
             }
 
+            // TAB 6: COSERVER (Cheat Engine bridge)
+            if (ImGui::BeginTabItem("CoServer"))
+            {
+                ImGui::BeginChild("CoServerChild", ImVec2(0, 0), false);
+
+                ImGui::TextWrapped(
+                    "Run a Cheat Engine CEServer on this machine. In Cheat Engine, "
+                    "open Process List -> Network, enter this PC's IP and port, and "
+                    "connect. All memory reads/writes are served through DBK64.");
+
+                ImGui::Spacing();
+
+                bool running = CEServerIsRunning();
+                ImGui::Text("Status: ");
+                ImGui::SameLine();
+                if (running)
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "RUNNING  (port %d, %d client%s)",
+                        CEServerPort(), CEServerClientCount(), CEServerClientCount() == 1 ? "" : "s");
+                else
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "STOPPED");
+
+                ImGui::SetNextItemWidth(160);
+                ImGui::InputText("Port", g_CoServerPort, sizeof(g_CoServerPort));
+
+                if (!running)
+                {
+                    if (ImGui::Button("Start Server", ImVec2(120, 26)))
+                    {
+                        int port = atoi(g_CoServerPort);
+                        if (port < 1 || port > 65535) port = 52736;
+                        if (!CEServerStart(port))
+                            ImGui::OpenPopup("ceserver_bind_failed");
+                    }
+                }
+                else
+                {
+                    if (ImGui::Button("Stop Server", ImVec2(120, 26)))
+                        CEServerStop();
+                }
+
+                if (ImGui::BeginPopupModal("ceserver_bind_failed", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+                {
+                    ImGui::Text("Could not start the server.\nIs the port already in use?");
+                    if (ImGui::Button("OK", ImVec2(120, 0)))
+                        ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Log:");
+                ImGui::BeginChild("CoServerLogChild", ImVec2(0, 0), true);
+                std::vector<std::string> log;
+                CEServerGetLog(log);
+                for (auto& line : log)
+                    ImGui::TextUnformatted(line.c_str());
+                // Auto-scroll to the latest entry.
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.0f)
+                    ImGui::SetScrollHereY(1.0f);
+                ImGui::EndChild();
+
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
 
@@ -1748,6 +1816,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
     glfwDestroyWindow(window);
     glfwTerminate();
+
+    CEServerStop();
 
     DisconnectDriver();
     StopAndUnloadDriver();
